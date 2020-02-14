@@ -1,0 +1,271 @@
+---
+title: "lab_6_bg"
+author: "Bridget Gibbons"
+date: "2/13/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE,
+                      message = FALSE,
+                      warning = FALSE)
+```
+
+```{r}
+#attach packages
+
+library(tidyverse)
+library(here)
+library(raster)
+library(janitor)
+library(sf)
+library(tmap)
+library(tmaptools)
+library(gstat)
+
+```
+
+## Grand Canyon GeoTIFF
+
+```{r}
+gc_dem <- raster(here("data", "gc_dem.tif"))
+
+# Look at it using plot():
+
+plot(gc_dem)
+
+# Check the CRS:
+gc_dem@crs
+
+# Check the extent (bounding box):
+gc_dem@extent
+
+# Run the CRS code again (up above), and then copy the arguments starting with the plus sign to the end
+# Create a wgs84 with latitude and longitude metrics instead (it's currently in utm)
+# Paste, change the proj, delete the stuff at the end
+# or could put in "proj=longlat +datum=WGS84 +ellps=WGS84 +no_defs"
+
+wgs84 <- "+proj=longlat +zone=12 +datum=WGS84 +units=m +no_defs" 
+
+gc_reproj <- projectRaster(gc_dem, crs = wgs84, method = "bilinear")
+
+gc_reproj@extent
+
+```
+
+
+### Crop raster to a smaller area (bounding box):
+
+```{r}
+
+bounds <- as(extent(-112.4, -112.0, 36.1, 36.3), 'SpatialPolygons')
+
+```
+
+### Make the CRS of our bounding boz the same as for gc_reproj:
+
+```{r}
+crs(bounds) <- crs(gc_reproj)
+```
+
+### Now let's crop our original spatial data:
+```{r}
+
+gc_crop <- crop(gc_reproj, bounds)
+
+plot(gc_crop)
+
+```
+
+### Resample using the `aggregate()` function:
+
+```{r}
+gc_agg <- raster::aggregate(gc_crop, fact = 10)
+
+plot(gc_agg)
+```
+
+### Now let's get safe & sound in ggplot:
+
+First, convert data to a data frame:
+
+```{r}
+gc_df <- as.data.frame(gc_agg, xy = TRUE)
+
+ggplot(data = gc_df, aes(x=x, y=y)) +
+  geom_raster(aes(fill = gc_dem)) +
+  coord_quickmap() +
+  theme_minimal() +
+  scale_fill_gradientn(colors = c("purple",
+                                  "magenta",
+                                  "orange",
+                                  "yellow", 
+                                  "white")
+                       )
+  
+```
+
+### How can I just select cells that match given criteria?
+
+```{r}
+
+gc_hab <- gc_crop
+
+# Set any cells outside of 1000 - 1500 to NA
+gc_hab[gc_hab > 1500 | gc_hab < 1000] <- NA
+
+# Plot.
+plot(gc_hab)
+
+# Cool! 
+
+```
+
+Now let's make this interactive with tmap:
+
+```{r}
+tmap_mode("view")
+
+tm_shape(gc_hab) +
+  tm_raster(legend.show = FALSE, palette = "plasma")
+
+# try getting tmap directly from devtools via github?
+```
+
+### Kriging rain in Kansas
+
+Read in the KS counties shapefile data
+
+```{r}
+ks_counties <- read_sf(here("data", "ks_counties", "ks_counties_shapefile.shp"))
+
+# Use base plot:
+plot(ks_counties)
+
+#Check CRS:
+st_crs(ks_counties) #there isn't one, so we should set one
+
+# Set to EPSG 4326:
+st_crs(ks_counties) <- 4326
+
+plot(ks_counties)
+
+```
+
+Practice in ggplot:
+```{r}
+
+ggplot(data = ks_counties) +
+  geom_sf()
+
+```
+
+Now, read in the rainfall data:
+
+```{r}
+ks_rain <- read_csv(here("data", "ks_rain.csv")) %>% 
+  clean_names() # R doesn't know that this is spatial data yet, just knows it has a column called lat and lon
+```
+
+Update the ks_rain data to be recognized as spatial points:
+
+```{r}
+
+ks_sf <- st_as_sf(ks_rain, coords = c("lon", "lat"), crs = 4326) # in the order of longitude and then latitude always, not the order of the columns
+
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = ks_counties) +
+  geom_sf(data = ks_sf,
+          aes(color = amt, size = amt))
+```
+
+## Kriging to predict rainfall:
+
+```{r}
+ks_sp <- as_Spatial(ks_sf)
+class(ks_sp)
+```
+
+### Make a spatial pixels grid that we'll make predictions over:
+
+```{r}
+#can look at bbox(ks_sp) to see the range of points we need to include
+
+lat <- seq(37, 40, length.out = 200) #creates a sequence of values from 37.0 to 40.0 with 200 evenly spaced values between them
+long <- seq(-94.6, -102, length.out = 200)
+
+# Now we're going to make this into a spatial grid:
+grid <- expand.grid(lon = long, lat = lat)
+grid_sf <- st_as_sf(grid, coords = c("lon", "lat"), crs = 4326)
+grid_sp <- as_Spatial(grid_sf)
+
+
+plot(grid_sp)
+```
+
+### Now, let's make a variogram (from the rainfall data)
+
+```{r}
+ks_vgm <- variogram(amt ~ 1, data = ks_sp)
+plot(ks_vgm)
+
+# estimate variogram parameters
+# guess nugget is around 0.1
+# guess sill is around 1.0
+# guess range is around 200
+
+ks_vgm_fit <- fit.variogram(ks_vgm, model = vgm(nugget = 0.1, psill = 1.0, range = 200, model = "Sph"))
+
+plot(ks_vgm, ks_vgm_fit)
+
+```
+
+### Now... krige!
+
+```{r}
+
+ks_krige <- krige(amt ~ 1, ks_sp, grid_sp, model = ks_vgm_fit)
+
+```
+
+```{r}
+spplot(ks_krige, "var1.pred")
+```
+
+### Make a data frame of kriged predictions
+
+```{r}
+ks_df <- data.frame(ks_krige@data["var1.pred"],
+                    ks_krige@data["var1.var"],
+                    ks_krige@coords) %>% 
+  rename(longitude = coords.x1,
+         latitude = coords.x2)
+
+# Convert this data frame to sf object:
+rain_sf <- st_as_sf(ks_df, coords = c("longitude", "latitude"), crs = 4326)
+
+ggplot(rain_sf) +
+  geom_sf(aes(color = var1.pred))
+```
+
+### Crop to the actual Kansas outline:
+
+```{r}
+ks <- read_sf(here("data", "states"),
+              layer = "cb_2017_us_state_20m") %>% 
+  dplyr::select(NAME) %>% 
+  filter(NAME == "Kansas") %>% 
+  st_transform(crs = 4326)
+```
+
+```{r}
+# Find thee intersection of the two:
+rain_sf_ks <- st_intersection(rain_sf, ks)
+
+ggplot(data = rain_sf_ks) +
+  geom_sf(aes(color = var1.pred))
+```
+
